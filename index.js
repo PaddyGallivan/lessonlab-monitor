@@ -1,0 +1,116 @@
+var __defProp = Object.defineProperty;
+var __name = (target, value) => __defProp(target, "name", { value, configurable: true });
+
+// index.js
+var index_default = {
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(runWeeklyReview(env));
+  },
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    if (url.pathname === "/run" && request.method === "POST") {
+      const result = await runWeeklyReview(env);
+      return new Response(JSON.stringify(result), { headers: { "Content-Type": "application/json" } });
+    }
+    return new Response(JSON.stringify({ status: "ok", worker: "lessonlab-monitor" }), { headers: { "Content-Type": "application/json" } });
+  }
+};
+async function runWeeklyReview(env) {
+  const db = env.DB;
+  const report = { timestamp: (/* @__PURE__ */ new Date()).toISOString(), alerts: [], summary: {} };
+  const generated = await db.prepare(
+    "SELECT COUNT(*) as total, subject, COUNT(CASE WHEN saved=1 THEN 1 END) as saved_count, COUNT(CASE WHEN rating=1 THEN 1 END) as good, COUNT(CASE WHEN rating=-1 THEN 1 END) as bad FROM ai_lessons WHERE created_at > datetime('now', '-7 days') GROUP BY subject ORDER BY total DESC"
+  ).all();
+  const totalGenerated = (generated.results || []).reduce((a, b) => a + (b.total || 0), 0);
+  const totalSaved = (generated.results || []).reduce((a, b) => a + (b.saved_count || 0), 0);
+  const totalGood = (generated.results || []).reduce((a, b) => a + (b.good || 0), 0);
+  const totalBad = (generated.results || []).reduce((a, b) => a + (b.bad || 0), 0);
+  const errors = await db.prepare(
+    "SELECT COUNT(*) as total, subject, error_message FROM generate_errors WHERE created_at > datetime('now', '-7 days') GROUP BY subject ORDER BY total DESC LIMIT 10"
+  ).all();
+  const totalErrors = (errors.results || []).reduce((a, b) => a + (b.total || 0), 0);
+  const errorRate = totalGenerated > 0 ? (totalErrors / totalGenerated * 100).toFixed(1) : 0;
+  const validationFails = await db.prepare(
+    "SELECT COUNT(*) as total FROM generate_errors WHERE error_message LIKE 'Validation:%' AND created_at > datetime('now', '-7 days')"
+  ).first();
+  const users = await db.prepare(
+    "SELECT COUNT(*) as total, COUNT(CASE WHEN tier='pro' THEN 1 END) as paid FROM users"
+  ).first();
+  const lessonsSaved = await db.prepare(
+    "SELECT COUNT(*) as total FROM lessons WHERE created_at > datetime('now', '-7 days')"
+  ).first();
+  report.summary = {
+    users: { total: users?.total || 0, paid: users?.paid || 0 },
+    generated: { total: totalGenerated, saved: totalSaved, save_rate: totalGenerated > 0 ? (totalSaved / totalGenerated * 100).toFixed(0) + "%" : "0%" },
+    ratings: { good: totalGood, bad: totalBad },
+    errors: { total: totalErrors, rate: errorRate + "%", validation_fails: validationFails?.total || 0 },
+    lessons_library: lessonsSaved?.total || 0,
+    by_subject: generated.results || []
+  };
+  if (parseFloat(errorRate) > 5) report.alerts.push(`\u{1F6A8} Error rate ${errorRate}% \u2014 above 5% threshold`);
+  if (totalBad > totalGood && totalGood + totalBad > 3) report.alerts.push(`\u26A0\uFE0F More bad ratings (${totalBad}) than good (${totalGood}) this week`);
+  if (validationFails?.total > 5) report.alerts.push(`\u26A0\uFE0F ${validationFails.total} VC2.0 validation failures this week \u2014 review prompt`);
+  if (totalGenerated === 0) report.alerts.push(`\u{1F4CA} No lessons generated this week \u2014 check if app is working`);
+  await db.prepare(
+    "INSERT INTO content_reviews (week_start, total_generated, total_rated, avg_rating, issues, created_at) VALUES (datetime('now', 'weekday 0', '-7 days'), ?, ?, ?, ?, datetime('now'))"
+  ).bind(
+    totalGenerated,
+    totalGood + totalBad,
+    totalGood + totalBad > 0 ? ((totalGood - totalBad) / (totalGood + totalBad)).toFixed(2) : null,
+    JSON.stringify(report.alerts)
+  ).run();
+  const SLACK_BRIDGE = env.SLACK_BRIDGE_URL || "https://slack-bridge.pgallivan.workers.dev";
+  const SLACK_CHANNEL = env.SLACK_CHANNEL || "C0ATZ5RM4SY";
+  const saveRate = report.summary.generated.save_rate;
+  const alertText = report.alerts.length > 0 ? "\n" + report.alerts.join("\n") : "\n\u2705 No alerts \u2014 all healthy";
+  const subjectBreakdown = (generated.results || []).map(
+    (s) => `  \u2022 ${s.subject || "?"}: ${s.total} generated, ${s.saved_count} saved`
+  ).join("\n");
+  const slackPayload = {
+    channel: SLACK_CHANNEL,
+    message: "\u{1F4DA} LessonLab Weekly Content Review",
+    blocks: [
+      { type: "header", text: { type: "plain_text", text: "\u{1F4DA} LessonLab Weekly Content Review" } },
+      { type: "section", fields: [
+        { type: "mrkdwn", text: `*Users*
+${users?.paid || 0} paid / ${users?.total || 0} total` },
+        { type: "mrkdwn", text: `*Generated*
+${totalGenerated} lessons` },
+        { type: "mrkdwn", text: `*Save rate*
+${saveRate}` },
+        { type: "mrkdwn", text: `*Error rate*
+${errorRate}%` },
+        { type: "mrkdwn", text: `*Ratings*
+\u{1F44D} ${totalGood} / \u{1F44E} ${totalBad}` },
+        { type: "mrkdwn", text: `*Library saves*
+${lessonsSaved?.total || 0}` }
+      ] },
+      ...subjectBreakdown ? [{ type: "section", text: { type: "mrkdwn", text: `*By Subject:*
+${subjectBreakdown}` } }] : [],
+      { type: "section", text: { type: "mrkdwn", text: `*Status:*${alertText}` } }
+    ]
+  };
+  await fetch(SLACK_BRIDGE, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(slackPayload)
+  }).catch((e) => console.error("Slack bridge error:", e.message));
+  if (env.COMMS_HUB_URL) {
+    await fetch(env.COMMS_HUB_URL + "/notify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        channel: "lessonlab",
+        type: "weekly_review",
+        data: report
+      })
+    }).catch(() => {
+    });
+  }
+  return report;
+}
+__name(runWeeklyReview, "runWeeklyReview");
+export {
+  index_default as default
+};
+//# sourceMappingURL=index.js.map
